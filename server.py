@@ -96,7 +96,7 @@ def _resolve_ref_obj(ref: str, context_spec_name: str) -> dict | None:
         return None
     if not spec:
         return None
-    parts = [p for p in json_path.split("/") if p]
+    parts = [p for p in json_path.lstrip("#").split("/") if p]
     current = spec
     for part in parts:
         if isinstance(current, dict) and part in current:
@@ -522,7 +522,7 @@ def resolve_ref(spec_name: str, ref: str) -> str:
     if not target_spec:
         return f"Spec '{spec_name}' not found."
 
-    parts = [p for p in json_path.split("/") if p]
+    parts = [p for p in json_path.lstrip("#").split("/") if p]
     current = target_spec
     for part in parts:
         if isinstance(current, dict) and part in current:
