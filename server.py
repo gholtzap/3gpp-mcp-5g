@@ -434,14 +434,28 @@ def list_schemas(spec_name: str) -> str:
     return f"Schemas in {spec_name} ({len(results)} total):\n" + "\n".join(results)
 
 
+def _text_matches(terms: list[str], text: str) -> bool:
+    text_lower = text.lower()
+    return all(t in text_lower for t in terms)
+
+
+def _any_term_in(terms: list[str], text: str) -> list[str]:
+    text_lower = text.lower()
+    return [t for t in terms if t in text_lower]
+
+
 @mcp.tool()
 def search_specs(query: str, max_results: int = 20, deep: bool = False) -> str:
-    """Search across all 3GPP specs for a keyword.
+    """Search across all 3GPP specs for a keyword or multi-word query.
+    Multi-word queries match specs containing ALL terms (in any order, any location).
     Searches paths, schema names, titles, and descriptions.
     Set deep=True to also search inside schema property names, enum values,
     parameter names, and operation descriptions (slower but more thorough).
     Results are ranked by relevance (title matches first, then paths, then schemas).
-    Example: search_specs('PDU Session'), search_specs('SUPI', deep=True)"""
+    Example: search_specs('PDU Session'), search_specs('context transfer'), search_specs('SUPI', deep=True)"""
+    terms = [t.lower() for t in query.split() if t]
+    if not terms:
+        return "Empty query."
     query_lower = query.lower()
     scored_results = []
 
@@ -452,21 +466,36 @@ def search_specs(query: str, max_results: int = 20, deep: bool = False) -> str:
 
         matches = []
         score = 0
+        term_hits = set()
 
         info = spec.get("info", {})
         title = info.get("title", "")
         desc = info.get("description", "")
+        title_hits = _any_term_in(terms, title)
+        desc_hits = _any_term_in(terms, desc)
         if query_lower in title.lower():
             matches.append(f"title match: {title}")
             score += 100
-        elif query_lower in desc.lower():
+            term_hits.update(terms)
+        elif title_hits:
+            matches.append(f"title match ({len(title_hits)}/{len(terms)} terms): {title}")
+            score += 60 * len(title_hits) // len(terms)
+            term_hits.update(title_hits)
+        if query_lower in desc.lower():
             matches.append(f"description match: {title}")
             score += 80
+            term_hits.update(terms)
+        elif desc_hits and not title_hits:
+            matches.append(f"description match ({len(desc_hits)}/{len(terms)} terms): {title}")
+            score += 40 * len(desc_hits) // len(terms)
+            term_hits.update(desc_hits)
 
         for path_str, path_obj in spec.get("paths", {}).items():
-            if query_lower in path_str.lower():
+            path_hits = _any_term_in(terms, path_str)
+            if path_hits:
                 matches.append(f"path: {path_str}")
-                score += 50
+                score += 50 * len(path_hits) // len(terms)
+                term_hits.update(path_hits)
             if deep and isinstance(path_obj, dict):
                 for method, details in path_obj.items():
                     if not isinstance(details, dict):
@@ -475,41 +504,54 @@ def search_specs(query: str, max_results: int = 20, deep: bool = False) -> str:
                     op_desc = details.get("description", "")
                     op_id = details.get("operationId", "")
                     for text in (op_summary, op_desc, op_id):
-                        if query_lower in str(text).lower():
-                            matches.append(f"operation: {method.upper()} {path_str} ({text[:60]})")
-                            score += 20
+                        text_hits = _any_term_in(terms, str(text))
+                        if text_hits:
+                            matches.append(f"operation: {method.upper()} {path_str} ({str(text)[:60]})")
+                            score += 20 * len(text_hits) // len(terms)
+                            term_hits.update(text_hits)
                             break
                     for param in details.get("parameters", []):
                         if isinstance(param, dict):
                             pname = param.get("name", "")
-                            if query_lower in pname.lower():
+                            if _any_term_in(terms, pname):
                                 matches.append(f"parameter: {pname} in {method.upper()} {path_str}")
                                 score += 10
+                                term_hits.update(_any_term_in(terms, pname))
 
         schemas = spec.get("components", {}).get("schemas", {})
         for schema_name, schema_obj in schemas.items():
-            if query_lower in schema_name.lower():
+            schema_hits = _any_term_in(terms, schema_name)
+            if schema_hits:
                 matches.append(f"schema: {schema_name}")
-                score += 40
+                score += 40 * len(schema_hits) // len(terms)
+                term_hits.update(schema_hits)
             elif deep and isinstance(schema_obj, dict):
                 all_props = _collect_properties_deep(schema_obj)
                 for prop_name in all_props:
-                    if query_lower in prop_name.lower():
+                    prop_hits = _any_term_in(terms, prop_name)
+                    if prop_hits:
                         matches.append(f"property: {schema_name}.{prop_name}")
                         score += 5
+                        term_hits.update(prop_hits)
                         break
                 enum_vals = schema_obj.get("enum", [])
                 for val in enum_vals:
-                    if query_lower in str(val).lower():
+                    val_hits = _any_term_in(terms, str(val))
+                    if val_hits:
                         matches.append(f"enum value: {schema_name} contains '{val}'")
                         score += 5
+                        term_hits.update(val_hits)
                         break
                 schema_desc = schema_obj.get("description", "")
-                if query_lower in schema_desc.lower():
+                desc_term_hits = _any_term_in(terms, schema_desc)
+                if desc_term_hits:
                     matches.append(f"schema description: {schema_name}")
                     score += 5
+                    term_hits.update(desc_term_hits)
 
         if matches:
+            if len(terms) > 1 and len(term_hits) == len(terms):
+                score += 200
             scored_results.append((score, name, matches))
 
     scored_results.sort(key=lambda x: x[0], reverse=True)
@@ -649,9 +691,10 @@ def resolve_ref(spec_name: str, ref: str) -> str:
 
 
 @mcp.tool()
-def get_request_response_summary(spec_name: str, path: str, method: str = "post", max_depth: int = 3) -> str:
+def get_request_response_summary(spec_name: str, path: str, method: str = "post", max_depth: int = 3, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     """Get a compact summary of what an endpoint expects (request body) and returns (response schemas).
     Much more focused than get_endpoint_resolved - shows only the data shapes you need for implementation.
+    max_chars limits output size (default 12000, 0 for unlimited).
     Example: get_request_response_summary('TS29509_Nausf_UEAuthentication', '/ue-authentications', 'post')"""
     spec = load_spec(spec_name)
     if not spec:
@@ -716,7 +759,8 @@ def get_request_response_summary(spec_name: str, path: str, method: str = "post"
                     break
             summary["responses"][status_code] = resp_entry
 
-    return json.dumps(summary, indent=2, default=str)
+    output = json.dumps(summary, indent=2, default=str)
+    return _truncate(output, max_chars)
 
 
 @mcp.tool()

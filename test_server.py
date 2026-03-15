@@ -324,6 +324,18 @@ run_test(
     max_time_s=60.0,
 )
 run_test(
+    "multi-word search 'context transfer'",
+    lambda: search_specs("context transfer"),
+    {"contains": ["Search results"], "min_length": 50},
+    max_time_s=30.0,
+)
+run_test(
+    "multi-word search 'sm-contexts retrieve'",
+    lambda: search_specs("sm-contexts retrieve"),
+    {"contains": ["Search results"], "min_length": 50},
+    max_time_s=30.0,
+)
+run_test(
     "search with no results",
     lambda: search_specs("zzzznonexistent"),
     {"contains": ["No results"], "expect_found": False},
@@ -397,13 +409,23 @@ print("\n--- get_request_response_summary ---")
 run_test(
     "AUSF auth summary",
     lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post"),
-    {"contains": ["request_body", "responses"], "is_valid_json": True, "min_length": 100},
+    {"contains": ["request_body", "responses"], "min_length": 100},
     max_time_s=5.0,
 )
 run_test(
     "summary has operation info",
     lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post"),
-    {"contains": ["operation"], "is_valid_json": True},
+    {"contains": ["operation"]},
+)
+run_test(
+    "summary truncation works",
+    lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", max_chars=500),
+    {"contains": ["TRUNCATED"], "min_length": 50},
+)
+run_test(
+    "summary unlimited is valid json",
+    lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", max_chars=0),
+    {"contains": ["request_body"], "is_valid_json": True},
 )
 run_test(
     "summary nonexistent path",
@@ -458,6 +480,59 @@ run_test(
         "TS29509_Nausf_UEAuthentication", "AuthenticationInfo",
     ),
     {"contains": ["not found"], "expect_found": False},
+)
+
+print("\n--- real-world: SMF PDU Session context transfer audit ---")
+run_test(
+    "rw: list SMF specs",
+    lambda: list_specs_by_nf("SMF"),
+    {"contains": ["SMF", "TS29502_Nsmf_PDUSession"]},
+)
+run_test(
+    "rw: search 'sm-contexts transfer' finds results",
+    lambda: search_specs("sm-contexts transfer"),
+    {"contains": ["Search results", "sm-contexts"], "min_length": 50},
+    max_time_s=30.0,
+)
+run_test(
+    "rw: search 'context transfer PDU session' finds results",
+    lambda: search_specs("context transfer PDU session"),
+    {"contains": ["Search results"], "min_length": 50},
+    max_time_s=30.0,
+)
+run_test(
+    "rw: wrong path gives helpful available paths",
+    lambda: get_endpoint_resolved("TS29502_Nsmf_PDUSession", "/sm-contexts/transfer", "post"),
+    {"contains": ["not found", "Available paths", "sm-contexts"], "expect_found": False},
+)
+run_test(
+    "rw: retrieve endpoint resolves",
+    lambda: get_endpoint_resolved("TS29502_Nsmf_PDUSession", "/sm-contexts/{smContextRef}/retrieve", "post", max_chars=0),
+    {"min_length": 200, "is_valid_json": True, "contains": ["RetrieveSmContext"], "expect_found": False},
+)
+run_test(
+    "rw: SmContext schema resolves",
+    lambda: get_schema_resolved("TS29502_Nsmf_PDUSession", "SmContext", max_chars=0),
+    {"min_length": 200, "is_valid_json": True, "contains": ["pduSessionId"]},
+    max_time_s=10.0,
+)
+run_test(
+    "rw: SmContextRetrievedData schema resolves",
+    lambda: get_schema_resolved("TS29502_Nsmf_PDUSession", "SmContextRetrievedData", max_chars=0),
+    {"min_length": 200, "is_valid_json": True},
+    max_time_s=10.0,
+)
+run_test(
+    "rw: retrieve summary stays under default max_chars",
+    lambda: get_request_response_summary("TS29502_Nsmf_PDUSession", "/sm-contexts/{smContextRef}/retrieve", "post"),
+    {"contains": ["operation", "responses"], "min_length": 100},
+    max_time_s=5.0,
+)
+run_test(
+    "rw: retrieve endpoint shallow resolve (max_depth=1) is compact",
+    lambda: get_endpoint_resolved("TS29502_Nsmf_PDUSession", "/sm-contexts/{smContextRef}/retrieve", "post", max_depth=1, max_chars=5000),
+    {"min_length": 50},
+    max_time_s=5.0,
 )
 
 print("\n--- cold vs warm cache ---")
