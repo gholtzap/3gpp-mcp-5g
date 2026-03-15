@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+.mcp.json
+.claude/
+*.egg-info/
+dist/
+build/
