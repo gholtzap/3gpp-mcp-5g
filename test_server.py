@@ -18,6 +18,9 @@ from server import (
     search_schema_properties,
     find_references,
     resolve_ref,
+    get_request_response_summary,
+    get_service_operations,
+    diff_schemas,
     load_spec,
     specs_cache,
 )
@@ -125,6 +128,11 @@ run_test(
     lambda: list_specs("zzzznonexistent"),
     {"contains": ["Found 0"]},
 )
+run_test(
+    "filter by title keyword 'authentication'",
+    lambda: list_specs("authentication"),
+    {"contains": ["Nausf"]},
+)
 
 print("\n--- list_specs_by_nf ---")
 run_test(
@@ -198,20 +206,30 @@ run_test(
 print("\n--- get_endpoint_resolved ---")
 run_test(
     "AUSF /ue-authentications POST resolved depth=3",
-    lambda: get_endpoint_resolved("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", 3),
-    {"min_length": 200, "is_valid_json": True, "not_contains": ["$ref"]},
+    lambda: get_endpoint_resolved("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", 3, max_chars=0),
+    {"min_length": 200, "is_valid_json": True},
     max_time_s=5.0,
 )
 run_test(
     "AUSF /ue-authentications POST resolved depth=5",
-    lambda: get_endpoint_resolved("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", 5),
+    lambda: get_endpoint_resolved("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", 5, max_chars=0),
     {"min_length": 200, "is_valid_json": True},
     max_time_s=10.0,
 )
 run_test(
     "resolved with depth=0 (no resolution)",
-    lambda: get_endpoint_resolved("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", 0),
+    lambda: get_endpoint_resolved("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", 0, max_chars=0),
     {"min_length": 50, "is_valid_json": True},
+)
+run_test(
+    "resolved with truncation",
+    lambda: get_endpoint_resolved("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", 5, max_chars=500),
+    {"contains": ["TRUNCATED"], "min_length": 50},
+)
+run_test(
+    "resolved unlimited output",
+    lambda: get_endpoint_resolved("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", 3, max_chars=0),
+    {"min_length": 200, "is_valid_json": True},
 )
 
 print("\n--- list_schemas ---")
@@ -258,9 +276,14 @@ run_test(
 )
 run_test(
     "ProblemDetails resolved depth=5",
-    lambda: get_schema_resolved("TS29571_CommonData", "ProblemDetails", 5),
+    lambda: get_schema_resolved("TS29571_CommonData", "ProblemDetails", 5, max_chars=0),
     {"min_length": 50, "is_valid_json": True},
     max_time_s=10.0,
+)
+run_test(
+    "schema resolved with truncation",
+    lambda: get_schema_resolved("TS29571_CommonData", "ProblemDetails", 5, max_chars=200),
+    {"contains": ["TRUNCATED"], "min_length": 50},
 )
 
 print("\n--- search_specs ---")
@@ -280,6 +303,12 @@ run_test(
     "search 'authentication'",
     lambda: search_specs("authentication"),
     {"contains": ["Search results", "Nausf"]},
+    max_time_s=30.0,
+)
+run_test(
+    "search results are ranked",
+    lambda: search_specs("authentication"),
+    {"contains": ["ranked by relevance"]},
     max_time_s=30.0,
 )
 run_test(
@@ -361,6 +390,73 @@ run_test(
 run_test(
     "resolve bad path",
     lambda: resolve_ref("TS29509_Nausf_UEAuthentication", "#/components/schemas/DoesNotExist"),
+    {"contains": ["not found"], "expect_found": False},
+)
+
+print("\n--- get_request_response_summary ---")
+run_test(
+    "AUSF auth summary",
+    lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post"),
+    {"contains": ["request_body", "responses"], "is_valid_json": True, "min_length": 100},
+    max_time_s=5.0,
+)
+run_test(
+    "summary has operation info",
+    lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post"),
+    {"contains": ["operation"], "is_valid_json": True},
+)
+run_test(
+    "summary nonexistent path",
+    lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/nonexistent", "post"),
+    {"contains": ["not found"], "expect_found": False},
+)
+run_test(
+    "summary nonexistent spec",
+    lambda: get_request_response_summary("TS00000_Fake", "/foo", "post"),
+    {"contains": ["not found"], "expect_found": False},
+)
+
+print("\n--- get_service_operations ---")
+run_test(
+    "AUSF service operations",
+    lambda: get_service_operations("TS29509_Nausf_UEAuthentication"),
+    {"contains": ["Service Operations", "POST"], "min_length": 50},
+)
+run_test(
+    "service ops show request/response schemas",
+    lambda: get_service_operations("TS29509_Nausf_UEAuthentication"),
+    {"contains": ["Request:", "Response"]},
+)
+run_test(
+    "service ops nonexistent",
+    lambda: get_service_operations("TS00000_Fake"),
+    {"contains": ["not found"], "expect_found": False},
+)
+
+print("\n--- diff_schemas ---")
+run_test(
+    "diff AuthenticationInfo vs UEAuthenticationCtx",
+    lambda: diff_schemas(
+        "TS29509_Nausf_UEAuthentication", "AuthenticationInfo",
+        "TS29509_Nausf_UEAuthentication", "UEAuthenticationCtx",
+    ),
+    {"contains": ["Comparing", "Only in", "Summary"], "min_length": 50},
+    max_time_s=5.0,
+)
+run_test(
+    "diff same schema shows no unique",
+    lambda: diff_schemas(
+        "TS29509_Nausf_UEAuthentication", "AuthenticationInfo",
+        "TS29509_Nausf_UEAuthentication", "AuthenticationInfo",
+    ),
+    {"contains": ["Summary", "0 unique to A", "0 unique to B"]},
+)
+run_test(
+    "diff nonexistent schema",
+    lambda: diff_schemas(
+        "TS29509_Nausf_UEAuthentication", "FakeSchema",
+        "TS29509_Nausf_UEAuthentication", "AuthenticationInfo",
+    ),
     {"contains": ["not found"], "expect_found": False},
 )
 

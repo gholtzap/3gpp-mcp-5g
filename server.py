@@ -1,11 +1,16 @@
 import yaml
 import json
 import re
+import pickle
+import hashlib
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 SPECS_DIR = Path(__file__).parent
+CACHE_PATH = SPECS_DIR / ".spec_cache.pkl"
 specs_cache: dict[str, dict] = {}
+
+DEFAULT_MAX_CHARS = 12000
 
 NF_GROUPS = {
     "AMF": ["Namf"],
@@ -62,9 +67,54 @@ mcp = FastMCP(
         "Start with search_specs or list_specs to find the right spec, then drill in with "
         "get_endpoint_resolved or get_schema_resolved to get complete details with all $ref "
         "references inlined. Use search_schema_properties to find which schemas contain a "
-        "specific field name. Use find_references to discover cross-spec dependencies."
+        "specific field name. Use find_references to discover cross-spec dependencies. "
+        "Use get_request_response_summary for a compact view of what an endpoint expects and returns. "
+        "Use get_service_operations to see all operations grouped by 3GPP service. "
+        "Use diff_schemas to compare two schemas and see their differences."
     ),
 )
+
+
+def _get_yaml_loader():
+    try:
+        return yaml.CSafeLoader
+    except AttributeError:
+        return yaml.SafeLoader
+
+
+_yaml_loader = _get_yaml_loader()
+
+
+def _compute_specs_hash() -> str:
+    h = hashlib.md5()
+    for p in sorted(SPECS_DIR.glob("TS*.yaml")):
+        h.update(p.name.encode())
+        h.update(str(p.stat().st_mtime_ns).encode())
+    return h.hexdigest()
+
+
+def _load_disk_cache() -> bool:
+    global specs_cache
+    if not CACHE_PATH.exists():
+        return False
+    try:
+        with open(CACHE_PATH, "rb") as f:
+            data = pickle.load(f)
+        if data.get("hash") != _compute_specs_hash():
+            return False
+        specs_cache = data["specs"]
+        return True
+    except Exception:
+        return False
+
+
+def _save_disk_cache():
+    try:
+        data = {"hash": _compute_specs_hash(), "specs": specs_cache}
+        with open(CACHE_PATH, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
 
 
 def load_spec(name: str) -> dict | None:
@@ -75,7 +125,7 @@ def load_spec(name: str) -> dict | None:
     if not path.exists():
         return None
     with open(path) as f:
-        spec = yaml.safe_load(f)
+        spec = yaml.load(f, Loader=_yaml_loader)
     specs_cache[name] = spec
     return spec
 
@@ -84,56 +134,97 @@ def get_all_spec_files() -> list[str]:
     return sorted(p.stem for p in SPECS_DIR.glob("TS*.yaml"))
 
 
-def _resolve_ref_obj(ref: str, context_spec_name: str) -> dict | None:
+def preload_all_specs():
+    if _load_disk_cache():
+        return
+    for name in get_all_spec_files():
+        load_spec(name)
+    _save_disk_cache()
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n\n... OUTPUT TRUNCATED at {max_chars} chars (total {len(text)}). Use more specific queries or get_schema_resolved for individual nested types."
+
+
+def _resolve_ref_obj(ref: str, context_spec_name: str) -> tuple[dict | None, str]:
     if ref.startswith("#"):
         spec = load_spec(context_spec_name)
         json_path = ref
+        resolved_context = context_spec_name
     elif "#" in ref:
         file_part, json_path = ref.split("#", 1)
         spec_name = file_part.replace(".yaml", "")
         spec = load_spec(spec_name)
+        resolved_context = spec_name
     else:
-        return None
+        return None, context_spec_name
     if not spec:
-        return None
+        return None, context_spec_name
     parts = [p for p in json_path.lstrip("#").split("/") if p]
     current = spec
     for part in parts:
         if isinstance(current, dict) and part in current:
             current = current[part]
         else:
-            return None
-    return current if isinstance(current, dict) else None
+            return None, context_spec_name
+    if isinstance(current, dict):
+        return current, resolved_context
+    return None, context_spec_name
 
 
-def _deep_resolve(obj, context_spec_name: str, depth: int = 0, max_depth: int = 5):
+def _deep_resolve(obj, context_spec_name: str, depth: int = 0, max_depth: int = 5, _seen: set | None = None):
     if depth > max_depth:
         return obj
+    if _seen is None:
+        _seen = set()
     if isinstance(obj, dict):
         if "$ref" in obj and len(obj) == 1:
-            resolved = _resolve_ref_obj(obj["$ref"], context_spec_name)
+            ref_str = obj["$ref"]
+            if ref_str in _seen:
+                return {"$circular_ref": ref_str}
+            _seen = _seen | {ref_str}
+            resolved, new_context = _resolve_ref_obj(ref_str, context_spec_name)
             if resolved is not None:
-                ref_str = obj["$ref"]
-                if "#" in ref_str and not ref_str.startswith("#"):
-                    new_context = ref_str.split("#")[0].replace(".yaml", "")
-                else:
-                    new_context = context_spec_name
-                return _deep_resolve(resolved, new_context, depth + 1, max_depth)
+                return _deep_resolve(resolved, new_context, depth + 1, max_depth, _seen)
             return obj
-        return {k: _deep_resolve(v, context_spec_name, depth, max_depth) for k, v in obj.items()}
+        return {k: _deep_resolve(v, context_spec_name, depth, max_depth, _seen) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_deep_resolve(item, context_spec_name, depth, max_depth) for item in obj]
+        return [_deep_resolve(item, context_spec_name, depth, max_depth, _seen) for item in obj]
     return obj
+
+
+def _collect_properties_deep(schema_obj: dict) -> dict:
+    props = dict(schema_obj.get("properties", {}))
+    for composition_key in ("allOf", "oneOf", "anyOf"):
+        for sub in schema_obj.get(composition_key, []):
+            if isinstance(sub, dict):
+                if "properties" in sub:
+                    props.update(sub["properties"])
+                if "$ref" not in sub:
+                    props.update(_collect_properties_deep(sub))
+    return props
 
 
 @mcp.tool()
 def list_specs(filter: str = "") -> str:
-    """List available 3GPP specs. Optionally filter by keyword (e.g. 'amf', 'Nausf', 'TS29509').
-    Returns spec name, title, and version. Use filter to narrow results."""
+    """List available 3GPP specs. Optionally filter by keyword (e.g. 'amf', 'Nausf', 'TS29509', 'authentication').
+    Searches both spec filenames AND titles. Returns spec name, title, and version."""
     specs = get_all_spec_files()
     if filter:
         pattern = filter.lower()
-        specs = [s for s in specs if pattern in s.lower()]
+        filtered = []
+        for s in specs:
+            if pattern in s.lower():
+                filtered.append(s)
+            else:
+                spec = load_spec(s)
+                if spec and "info" in spec:
+                    title = spec["info"].get("title", "")
+                    if pattern in title.lower():
+                        filtered.append(s)
+        specs = filtered
 
     results = []
     for name in specs:
@@ -255,10 +346,11 @@ def get_endpoint(spec_name: str, path: str, method: str = "get") -> str:
 
 
 @mcp.tool()
-def get_endpoint_resolved(spec_name: str, path: str, method: str = "get", max_depth: int = 3) -> str:
+def get_endpoint_resolved(spec_name: str, path: str, method: str = "get", max_depth: int = 3, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     """Get full details of a specific API endpoint with all $ref references recursively resolved inline.
     This gives you the complete picture in a single call - request body schemas, response schemas, error types all expanded.
     max_depth controls how deep to resolve nested refs (default 3).
+    max_chars limits output size to save context (default 12000, 0 for unlimited).
     Example: get_endpoint_resolved('TS29509_Nausf_UEAuthentication', '/ue-authentications', 'post')"""
     spec = load_spec(spec_name)
     if not spec:
@@ -277,7 +369,8 @@ def get_endpoint_resolved(spec_name: str, path: str, method: str = "get", max_de
         return f"Method '{method}' not found for {path}. Available: {available}"
 
     resolved = _deep_resolve(details, spec_name, max_depth=max_depth)
-    return json.dumps(resolved, indent=2, default=str)
+    output = json.dumps(resolved, indent=2, default=str)
+    return _truncate(output, max_chars)
 
 
 @mcp.tool()
@@ -299,10 +392,11 @@ def get_schema(spec_name: str, schema_name: str) -> str:
 
 
 @mcp.tool()
-def get_schema_resolved(spec_name: str, schema_name: str, max_depth: int = 3) -> str:
+def get_schema_resolved(spec_name: str, schema_name: str, max_depth: int = 3, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     """Get a specific schema with all $ref references recursively resolved inline.
     Gives you the full expanded schema in one call, including referenced types from other specs.
     max_depth controls how deep to resolve nested refs (default 3).
+    max_chars limits output size to save context (default 12000, 0 for unlimited).
     Example: get_schema_resolved('TS29509_Nausf_UEAuthentication', 'AuthenticationInfo')"""
     spec = load_spec(spec_name)
     if not spec:
@@ -315,7 +409,8 @@ def get_schema_resolved(spec_name: str, schema_name: str, max_depth: int = 3) ->
         return f"Schema '{schema_name}' not found. Available schemas ({len(available)}): {', '.join(available)}"
 
     resolved = _deep_resolve(schema, spec_name, max_depth=max_depth)
-    return json.dumps(resolved, indent=2, default=str)
+    output = json.dumps(resolved, indent=2, default=str)
+    return _truncate(output, max_chars)
 
 
 @mcp.tool()
@@ -345,9 +440,10 @@ def search_specs(query: str, max_results: int = 20, deep: bool = False) -> str:
     Searches paths, schema names, titles, and descriptions.
     Set deep=True to also search inside schema property names, enum values,
     parameter names, and operation descriptions (slower but more thorough).
+    Results are ranked by relevance (title matches first, then paths, then schemas).
     Example: search_specs('PDU Session'), search_specs('SUPI', deep=True)"""
     query_lower = query.lower()
-    results = []
+    scored_results = []
 
     for name in get_all_spec_files():
         spec = load_spec(name)
@@ -355,16 +451,22 @@ def search_specs(query: str, max_results: int = 20, deep: bool = False) -> str:
             continue
 
         matches = []
+        score = 0
 
         info = spec.get("info", {})
         title = info.get("title", "")
         desc = info.get("description", "")
-        if query_lower in title.lower() or query_lower in desc.lower():
-            matches.append(f"title/description match: {title}")
+        if query_lower in title.lower():
+            matches.append(f"title match: {title}")
+            score += 100
+        elif query_lower in desc.lower():
+            matches.append(f"description match: {title}")
+            score += 80
 
         for path_str, path_obj in spec.get("paths", {}).items():
             if query_lower in path_str.lower():
                 matches.append(f"path: {path_str}")
+                score += 50
             if deep and isinstance(path_obj, dict):
                 for method, details in path_obj.items():
                     if not isinstance(details, dict):
@@ -375,45 +477,58 @@ def search_specs(query: str, max_results: int = 20, deep: bool = False) -> str:
                     for text in (op_summary, op_desc, op_id):
                         if query_lower in str(text).lower():
                             matches.append(f"operation: {method.upper()} {path_str} ({text[:60]})")
+                            score += 20
                             break
                     for param in details.get("parameters", []):
                         if isinstance(param, dict):
                             pname = param.get("name", "")
                             if query_lower in pname.lower():
                                 matches.append(f"parameter: {pname} in {method.upper()} {path_str}")
+                                score += 10
 
         schemas = spec.get("components", {}).get("schemas", {})
         for schema_name, schema_obj in schemas.items():
             if query_lower in schema_name.lower():
                 matches.append(f"schema: {schema_name}")
+                score += 40
             elif deep and isinstance(schema_obj, dict):
-                for prop_name in schema_obj.get("properties", {}):
+                all_props = _collect_properties_deep(schema_obj)
+                for prop_name in all_props:
                     if query_lower in prop_name.lower():
                         matches.append(f"property: {schema_name}.{prop_name}")
+                        score += 5
                         break
                 enum_vals = schema_obj.get("enum", [])
                 for val in enum_vals:
                     if query_lower in str(val).lower():
                         matches.append(f"enum value: {schema_name} contains '{val}'")
+                        score += 5
                         break
                 schema_desc = schema_obj.get("description", "")
                 if query_lower in schema_desc.lower():
                     matches.append(f"schema description: {schema_name}")
+                    score += 5
 
         if matches:
-            results.append(f"\n{name}:\n" + "\n".join(f"  - {m}" for m in matches))
-            if len(results) >= max_results:
-                break
+            scored_results.append((score, name, matches))
 
-    if not results:
+    scored_results.sort(key=lambda x: x[0], reverse=True)
+    scored_results = scored_results[:max_results]
+
+    if not scored_results:
         return f"No results found for '{query}'."
 
-    return f"Search results for '{query}' ({len(results)} specs matched):" + "".join(results)
+    output_parts = []
+    for _score, name, matches in scored_results:
+        output_parts.append(f"\n{name}:\n" + "\n".join(f"  - {m}" for m in matches))
+
+    return f"Search results for '{query}' ({len(scored_results)} specs matched, ranked by relevance):" + "".join(output_parts)
 
 
 @mcp.tool()
 def search_schema_properties(property_name: str, max_results: int = 30) -> str:
     """Find all schemas across all specs that contain a specific property/field name.
+    Searches inside allOf/oneOf/anyOf compositions too.
     Useful for finding which data models use a particular field.
     Example: search_schema_properties('supi'), search_schema_properties('dnn')"""
     prop_lower = property_name.lower()
@@ -428,7 +543,7 @@ def search_schema_properties(property_name: str, max_results: int = 30) -> str:
         for schema_name, schema_obj in schemas.items():
             if not isinstance(schema_obj, dict):
                 continue
-            props = schema_obj.get("properties", {})
+            props = _collect_properties_deep(schema_obj)
             matching_props = [p for p in props if prop_lower in p.lower()]
             if matching_props:
                 required = schema_obj.get("required", [])
@@ -532,6 +647,264 @@ def resolve_ref(spec_name: str, ref: str) -> str:
 
     return json.dumps(current, indent=2, default=str)
 
+
+@mcp.tool()
+def get_request_response_summary(spec_name: str, path: str, method: str = "post", max_depth: int = 3) -> str:
+    """Get a compact summary of what an endpoint expects (request body) and returns (response schemas).
+    Much more focused than get_endpoint_resolved - shows only the data shapes you need for implementation.
+    Example: get_request_response_summary('TS29509_Nausf_UEAuthentication', '/ue-authentications', 'post')"""
+    spec = load_spec(spec_name)
+    if not spec:
+        return f"Spec '{spec_name}' not found."
+
+    paths = spec.get("paths", {})
+    endpoint = paths.get(path)
+    if not endpoint:
+        available = list(paths.keys())
+        return f"Path '{path}' not found. Available paths: {available}"
+
+    method_lower = method.lower()
+    details = endpoint.get(method_lower)
+    if not details:
+        available = [m for m in endpoint.keys() if m in ("get", "post", "put", "patch", "delete")]
+        return f"Method '{method}' not found for {path}. Available: {available}"
+
+    summary = {
+        "operation": details.get("operationId", details.get("summary", "")),
+        "description": details.get("description", ""),
+    }
+
+    params = details.get("parameters", [])
+    if params:
+        resolved_params = _deep_resolve(params, spec_name, max_depth=2)
+        summary["parameters"] = []
+        for p in resolved_params:
+            if isinstance(p, dict):
+                summary["parameters"].append({
+                    "name": p.get("name"),
+                    "in": p.get("in"),
+                    "required": p.get("required", False),
+                    "schema": p.get("schema"),
+                })
+
+    req_body = details.get("requestBody", {})
+    if req_body:
+        resolved_body = _deep_resolve(req_body, spec_name, max_depth=max_depth)
+        content = resolved_body.get("content", {})
+        for content_type, content_obj in content.items():
+            if isinstance(content_obj, dict) and "schema" in content_obj:
+                summary["request_body"] = {
+                    "content_type": content_type,
+                    "required": resolved_body.get("required", False),
+                    "schema": content_obj["schema"],
+                }
+                break
+
+    responses = details.get("responses", {})
+    if responses:
+        resolved_responses = _deep_resolve(responses, spec_name, max_depth=max_depth)
+        summary["responses"] = {}
+        for status_code, resp_obj in resolved_responses.items():
+            if not isinstance(resp_obj, dict):
+                continue
+            resp_entry = {"description": resp_obj.get("description", "")}
+            content = resp_obj.get("content", {})
+            for content_type, content_obj in content.items():
+                if isinstance(content_obj, dict) and "schema" in content_obj:
+                    resp_entry["content_type"] = content_type
+                    resp_entry["schema"] = content_obj["schema"]
+                    break
+            summary["responses"][status_code] = resp_entry
+
+    return json.dumps(summary, indent=2, default=str)
+
+
+@mcp.tool()
+def get_service_operations(spec_name: str) -> str:
+    """Get all operations in a spec grouped by 3GPP service, showing the logical flow.
+    More useful than get_paths for understanding service-based interfaces.
+    Example: get_service_operations('TS29509_Nausf_UEAuthentication')"""
+    spec = load_spec(spec_name)
+    if not spec:
+        return f"Spec '{spec_name}' not found."
+
+    info = spec.get("info", {})
+    title = info.get("title", spec_name)
+
+    tags_map: dict[str, list] = {}
+    untagged = []
+
+    for path_str, path_obj in spec.get("paths", {}).items():
+        if not isinstance(path_obj, dict):
+            continue
+        for method, details in path_obj.items():
+            if method not in ("get", "post", "put", "patch", "delete", "options", "head"):
+                continue
+            if not isinstance(details, dict):
+                continue
+
+            op_id = details.get("operationId", "")
+            op_summary = details.get("summary", "")
+            tags = details.get("tags", [])
+
+            req_schema = ""
+            req_body = details.get("requestBody", {})
+            if isinstance(req_body, dict):
+                content = req_body.get("content", {})
+                for ct, ct_obj in content.items():
+                    if isinstance(ct_obj, dict) and "schema" in ct_obj:
+                        schema = ct_obj["schema"]
+                        if "$ref" in schema:
+                            req_schema = schema["$ref"].split("/")[-1]
+                        elif "type" in schema:
+                            req_schema = schema["type"]
+                        break
+
+            resp_schemas = []
+            for code, resp in details.get("responses", {}).items():
+                if not isinstance(resp, dict):
+                    continue
+                content = resp.get("content", {})
+                for ct, ct_obj in content.items():
+                    if isinstance(ct_obj, dict) and "schema" in ct_obj:
+                        schema = ct_obj["schema"]
+                        if "$ref" in schema:
+                            resp_schemas.append(f"{code}:{schema['$ref'].split('/')[-1]}")
+                        elif "type" in schema:
+                            resp_schemas.append(f"{code}:{schema['type']}")
+                        break
+
+            entry = f"  {method.upper()} {path_str}"
+            if op_id:
+                entry += f" [{op_id}]"
+            if op_summary:
+                entry += f" - {op_summary}"
+            if req_schema:
+                entry += f"\n    Request: {req_schema}"
+            if resp_schemas:
+                entry += f"\n    Responses: {', '.join(resp_schemas)}"
+
+            if tags:
+                for tag in tags:
+                    tags_map.setdefault(tag, []).append(entry)
+            else:
+                untagged.append(entry)
+
+    parts = [f"Service Operations in {title}:"]
+
+    for tag, ops in sorted(tags_map.items()):
+        parts.append(f"\n[{tag}]")
+        parts.extend(ops)
+
+    if untagged:
+        if tags_map:
+            parts.append("\n[Other]")
+        parts.extend(untagged)
+
+    return "\n".join(parts)
+
+
+@mcp.tool()
+def diff_schemas(spec_name_a: str, schema_name_a: str, spec_name_b: str, schema_name_b: str, max_depth: int = 2) -> str:
+    """Compare two schemas and show their differences.
+    Useful for debugging why a request doesn't match what a spec expects.
+    Can compare schemas within the same spec or across different specs.
+    Example: diff_schemas('TS29509_Nausf_UEAuthentication', 'AuthenticationInfo', 'TS29509_Nausf_UEAuthentication', 'UEAuthenticationCtx')"""
+    spec_a = load_spec(spec_name_a)
+    if not spec_a:
+        return f"Spec '{spec_name_a}' not found."
+    spec_b = load_spec(spec_name_b)
+    if not spec_b:
+        return f"Spec '{spec_name_b}' not found."
+
+    schemas_a = spec_a.get("components", {}).get("schemas", {})
+    schema_a = schemas_a.get(schema_name_a)
+    if not schema_a:
+        return f"Schema '{schema_name_a}' not found in {spec_name_a}."
+
+    schemas_b = spec_b.get("components", {}).get("schemas", {})
+    schema_b = schemas_b.get(schema_name_b)
+    if not schema_b:
+        return f"Schema '{schema_name_b}' not found in {spec_name_b}."
+
+    resolved_a = _deep_resolve(schema_a, spec_name_a, max_depth=max_depth)
+    resolved_b = _deep_resolve(schema_b, spec_name_b, max_depth=max_depth)
+
+    label_a = f"{spec_name_a}/{schema_name_a}"
+    label_b = f"{spec_name_b}/{schema_name_b}"
+
+    result = [f"Comparing {label_a} vs {label_b}:"]
+
+    type_a = resolved_a.get("type", "N/A")
+    type_b = resolved_b.get("type", "N/A")
+    if type_a != type_b:
+        result.append(f"\nType differs: {label_a}={type_a}, {label_b}={type_b}")
+
+    props_a = set(_collect_properties_deep(resolved_a).keys()) if isinstance(resolved_a, dict) else set()
+    props_b = set(_collect_properties_deep(resolved_b).keys()) if isinstance(resolved_b, dict) else set()
+
+    only_a = sorted(props_a - props_b)
+    only_b = sorted(props_b - props_a)
+    common = sorted(props_a & props_b)
+
+    req_a = set(resolved_a.get("required", []))
+    req_b = set(resolved_b.get("required", []))
+
+    if only_a:
+        result.append(f"\nOnly in {label_a} ({len(only_a)}):")
+        all_props_a = _collect_properties_deep(resolved_a)
+        for p in only_a:
+            prop_def = all_props_a.get(p, {})
+            ptype = ""
+            if isinstance(prop_def, dict):
+                ptype = prop_def.get("type", "")
+                if "$ref" in prop_def:
+                    ptype = prop_def["$ref"].split("/")[-1]
+            req = " (required)" if p in req_a else ""
+            result.append(f"  {p}: {ptype}{req}")
+
+    if only_b:
+        result.append(f"\nOnly in {label_b} ({len(only_b)}):")
+        all_props_b = _collect_properties_deep(resolved_b)
+        for p in only_b:
+            prop_def = all_props_b.get(p, {})
+            ptype = ""
+            if isinstance(prop_def, dict):
+                ptype = prop_def.get("type", "")
+                if "$ref" in prop_def:
+                    ptype = prop_def["$ref"].split("/")[-1]
+            req = " (required)" if p in req_b else ""
+            result.append(f"  {p}: {ptype}{req}")
+
+    if common:
+        diffs = []
+        all_props_a = _collect_properties_deep(resolved_a)
+        all_props_b = _collect_properties_deep(resolved_b)
+        for p in common:
+            def_a = all_props_a.get(p, {})
+            def_b = all_props_b.get(p, {})
+            type_a = ""
+            type_b = ""
+            if isinstance(def_a, dict):
+                type_a = def_a.get("type", def_a.get("$ref", "").split("/")[-1] if "$ref" in def_a else "")
+            if isinstance(def_b, dict):
+                type_b = def_b.get("type", def_b.get("$ref", "").split("/")[-1] if "$ref" in def_b else "")
+            if type_a != type_b:
+                diffs.append(f"  {p}: {type_a} vs {type_b}")
+            elif (p in req_a) != (p in req_b):
+                ra = "required" if p in req_a else "optional"
+                rb = "required" if p in req_b else "optional"
+                diffs.append(f"  {p}: {ra} vs {rb}")
+        if diffs:
+            result.append(f"\nDiffering common properties:")
+            result.extend(diffs)
+
+    result.append(f"\nSummary: {len(props_a)} vs {len(props_b)} properties, {len(only_a)} unique to A, {len(only_b)} unique to B, {len(common)} shared")
+
+    return "\n".join(result)
+
+
+preload_all_specs()
 
 if __name__ == "__main__":
     mcp.run()
