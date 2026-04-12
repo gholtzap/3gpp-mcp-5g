@@ -103,6 +103,68 @@ def run_test(name, func, checks=None, max_time_s=5.0):
             print(f"    | {line}")
 
 
+def validate_multi_term_search_results(query: str, deep: bool = False) -> str:
+    result = search_specs(query, deep=deep)
+    if "Search results" not in result:
+        raise AssertionError(f"search_specs did not return results for '{query}': {result}")
+
+    terms = [term.lower() for term in query.split() if term]
+    returned_specs = [
+        line[:-1]
+        for line in result.splitlines()
+        if line and not line.startswith(" ") and line.endswith(":") and not line.startswith("Search results")
+    ]
+    if not returned_specs:
+        raise AssertionError(f"search_specs returned no spec sections for '{query}'")
+
+    for spec_name in returned_specs:
+        spec = load_spec(spec_name)
+        if not spec:
+            raise AssertionError(f"returned spec could not be loaded: {spec_name}")
+
+        searchable_texts = []
+        info = spec.get("info", {})
+        searchable_texts.extend([info.get("title", ""), info.get("description", "")])
+        searchable_texts.extend(spec.get("paths", {}).keys())
+        searchable_texts.extend(spec.get("components", {}).get("schemas", {}).keys())
+
+        if deep:
+            for path_obj in spec.get("paths", {}).values():
+                if not isinstance(path_obj, dict):
+                    continue
+                for details in path_obj.values():
+                    if not isinstance(details, dict):
+                        continue
+                    searchable_texts.extend(
+                        [
+                            str(details.get("summary", "")),
+                            str(details.get("description", "")),
+                            str(details.get("operationId", "")),
+                        ]
+                    )
+                    for param in details.get("parameters", []):
+                        if isinstance(param, dict):
+                            searchable_texts.append(str(param.get("name", "")))
+
+            for schema_obj in spec.get("components", {}).get("schemas", {}).values():
+                if not isinstance(schema_obj, dict):
+                    continue
+                searchable_texts.append(str(schema_obj.get("description", "")))
+                for prop_name in schema_obj.get("properties", {}).keys():
+                    searchable_texts.append(str(prop_name))
+                for enum_val in schema_obj.get("enum", []):
+                    searchable_texts.append(str(enum_val))
+
+        searchable_texts = [text.lower() for text in searchable_texts if text]
+        missing_terms = [term for term in terms if not any(term in text for text in searchable_texts)]
+        if missing_terms:
+            raise AssertionError(
+                f"returned spec '{spec_name}' is missing query terms {missing_terms} for '{query}'"
+            )
+
+    return f"validated {len(returned_specs)} specs for '{query}'"
+
+
 print("=" * 70)
 print("3GPP MCP Server Test Suite")
 print("=" * 70)
@@ -330,9 +392,21 @@ run_test(
     max_time_s=30.0,
 )
 run_test(
+    "multi-word search validates all terms for 'context transfer'",
+    lambda: validate_multi_term_search_results("context transfer"),
+    {"contains": ["validated"]},
+    max_time_s=30.0,
+)
+run_test(
     "multi-word search 'sm-contexts retrieve'",
     lambda: search_specs("sm-contexts retrieve"),
     {"contains": ["Search results"], "min_length": 50},
+    max_time_s=30.0,
+)
+run_test(
+    "multi-word search validates all terms for 'sm-contexts retrieve'",
+    lambda: validate_multi_term_search_results("sm-contexts retrieve"),
+    {"contains": ["validated"]},
     max_time_s=30.0,
 )
 run_test(

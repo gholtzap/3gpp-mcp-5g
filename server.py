@@ -613,7 +613,9 @@ def search_specs(query: str, max_results: int = 20, deep: bool = False) -> str:
                     term_hits.update(desc_term_hits)
 
         if matches:
-            if len(terms) > 1 and len(term_hits) == len(terms):
+            if len(terms) > 1:
+                if len(term_hits) != len(terms):
+                    continue
                 score += 200
             scored_results.append((score, name, matches))
 
