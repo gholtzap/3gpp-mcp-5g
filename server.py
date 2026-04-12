@@ -258,6 +258,82 @@ def _deep_resolve(obj, context_spec_name: str, depth: int = 0, max_depth: int = 
     return obj
 
 
+def _resolve_ref_chain(obj, context_spec_name: str, max_depth: int = 5) -> tuple[object, str]:
+    current = obj
+    current_context = context_spec_name
+    seen_refs: set[str] = set()
+
+    for _ in range(max_depth):
+        if not isinstance(current, dict) or len(current) != 1 or "$ref" not in current:
+            break
+        ref_str = current.get("$ref")
+        if not isinstance(ref_str, str) or ref_str in seen_refs:
+            break
+        seen_refs.add(ref_str)
+        resolved, resolved_context = _resolve_ref_obj(ref_str, current_context)
+        if resolved is None:
+            break
+        current = resolved
+        current_context = resolved_context
+
+    return current, current_context
+
+
+def _extract_schema_label(schema_obj) -> str:
+    if not isinstance(schema_obj, dict):
+        return ""
+
+    ref_str = schema_obj.get("$ref")
+    if isinstance(ref_str, str):
+        return ref_str.split("/")[-1]
+
+    for composition_key in ("allOf", "oneOf", "anyOf"):
+        for sub in schema_obj.get(composition_key, []):
+            label = _extract_schema_label(sub)
+            if label:
+                return label
+
+    items = schema_obj.get("items")
+    item_label = _extract_schema_label(items)
+    if item_label:
+        return item_label
+
+    properties = schema_obj.get("properties", {})
+    if isinstance(properties, dict):
+        for preferred_name in ("jsonData", "problemDetails", "redirectResponse"):
+            label = _extract_schema_label(properties.get(preferred_name))
+            if label:
+                return label
+        for prop_schema in properties.values():
+            label = _extract_schema_label(prop_schema)
+            if label:
+                return label
+
+    schema_type = schema_obj.get("type")
+    return schema_type if isinstance(schema_type, str) else ""
+
+
+def _extract_primary_content_label(content_obj) -> str:
+    if not isinstance(content_obj, dict):
+        return ""
+
+    for content_entry in content_obj.values():
+        if not isinstance(content_entry, dict):
+            continue
+        label = _extract_schema_label(content_entry.get("schema"))
+        if label:
+            return label
+
+    return ""
+
+
+def _normalize_summary_label(text: str, max_chars: int = 60) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[: max_chars - 3] + "..."
+
+
 def _collect_properties_deep(
     schema_obj: dict,
     context_spec_name: str | None = None,
@@ -879,31 +955,22 @@ def get_service_operations(spec_name: str) -> str:
             tags = details.get("tags", [])
 
             req_schema = ""
-            req_body = details.get("requestBody", {})
+            req_body, _ = _resolve_ref_chain(details.get("requestBody", {}), spec_name)
             if isinstance(req_body, dict):
-                content = req_body.get("content", {})
-                for ct, ct_obj in content.items():
-                    if isinstance(ct_obj, dict) and "schema" in ct_obj:
-                        schema = ct_obj["schema"]
-                        if "$ref" in schema:
-                            req_schema = schema["$ref"].split("/")[-1]
-                        elif "type" in schema:
-                            req_schema = schema["type"]
-                        break
+                req_schema = _extract_primary_content_label(req_body.get("content", {}))
 
             resp_schemas = []
             for code, resp in details.get("responses", {}).items():
+                resp, _ = _resolve_ref_chain(resp, spec_name)
                 if not isinstance(resp, dict):
                     continue
-                content = resp.get("content", {})
-                for ct, ct_obj in content.items():
-                    if isinstance(ct_obj, dict) and "schema" in ct_obj:
-                        schema = ct_obj["schema"]
-                        if "$ref" in schema:
-                            resp_schemas.append(f"{code}:{schema['$ref'].split('/')[-1]}")
-                        elif "type" in schema:
-                            resp_schemas.append(f"{code}:{schema['type']}")
-                        break
+                resp_label = _extract_primary_content_label(resp.get("content", {}))
+                if resp_label:
+                    resp_schemas.append(f"{code}:{resp_label}")
+                    continue
+                resp_description = resp.get("description", "")
+                if isinstance(resp_description, str) and resp_description.strip():
+                    resp_schemas.append(f"{code}:{_normalize_summary_label(resp_description)}")
 
             entry = f"  {method.upper()} {path_str}"
             if op_id:

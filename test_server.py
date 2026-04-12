@@ -559,6 +559,11 @@ run_test(
     {"contains": ["Request:", "Response"]},
 )
 run_test(
+    "service ops resolve shared response refs",
+    lambda: get_service_operations("TS29502_Nsmf_PDUSession"),
+    {"contains": ["307:RedirectResponse", "500:ProblemDetails", "default:Generic Error"]},
+)
+run_test(
     "service ops nonexistent",
     lambda: get_service_operations("TS00000_Fake"),
     {"contains": ["not found"], "expect_found": False},
