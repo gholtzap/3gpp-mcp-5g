@@ -9,6 +9,7 @@ from server import (
     list_specs,
     list_specs_by_nf,
     get_spec_info,
+    compare_spec_releases,
     get_paths,
     get_endpoint,
     get_endpoint_resolved,
@@ -20,6 +21,12 @@ from server import (
     find_references,
     resolve_ref,
     get_request_response_summary,
+    list_callbacks,
+    trace_procedure,
+    show_nf_interactions,
+    validate_payload,
+    explain_problem_details,
+    match_sbi_trace,
     get_service_operations,
     diff_schemas,
     load_spec,
@@ -38,6 +45,12 @@ warned = 0
 timings = []
 
 
+def result_text(result):
+    if isinstance(result, (dict, list)):
+        return json.dumps(result, indent=2, sort_keys=True)
+    return "" if result is None else str(result)
+
+
 def run_test(name, func, checks=None, max_time_s=5.0):
     global total, passed, failed, warned
     total += 1
@@ -52,6 +65,7 @@ def run_test(name, func, checks=None, max_time_s=5.0):
         return
     elapsed = time.perf_counter() - start
     timings.append((name, elapsed, None))
+    rendered = result_text(result)
 
     issues = []
     if elapsed > max_time_s:
@@ -59,29 +73,36 @@ def run_test(name, func, checks=None, max_time_s=5.0):
 
     if result is None:
         issues.append("returned None")
+    elif isinstance(result, dict) and "ok" in result:
+        expect_ok = True if not checks else checks.get("expect_ok", True)
+        if result.get("ok") is False and expect_ok:
+            issues.append(f"unexpected error: {result.get('error', {}).get('message', 'unknown error')}")
+        elif result.get("ok") is True and not expect_ok:
+            issues.append("expected an error response")
     elif isinstance(result, str) and "not found" in result.lower() and checks and checks.get("expect_found", True):
         issues.append(f"unexpected 'not found': {result[:120]}")
 
     if checks:
         if "contains" in checks:
-            for text in checks["contains"]:
-                if text.lower() not in result.lower():
-                    issues.append(f"missing expected text: '{text}'")
+            for expected in checks["contains"]:
+                if expected.lower() not in rendered.lower():
+                    issues.append(f"missing expected text: '{expected}'")
         if "not_contains" in checks:
-            for text in checks["not_contains"]:
-                if text.lower() in result.lower():
-                    issues.append(f"unexpected text found: '{text}'")
+            for unexpected in checks["not_contains"]:
+                if unexpected.lower() in rendered.lower():
+                    issues.append(f"unexpected text found: '{unexpected}'")
         if "min_length" in checks:
-            if len(result) < checks["min_length"]:
-                issues.append(f"too short: {len(result)} < {checks['min_length']}")
+            if len(rendered) < checks["min_length"]:
+                issues.append(f"too short: {len(rendered)} < {checks['min_length']}")
         if "is_valid_json" in checks and checks["is_valid_json"]:
-            try:
-                json.loads(result)
-            except (json.JSONDecodeError, TypeError):
-                issues.append("not valid JSON")
+            if not isinstance(result, (dict, list)):
+                try:
+                    json.loads(rendered)
+                except (json.JSONDecodeError, TypeError):
+                    issues.append("not valid JSON")
         if "max_length" in checks:
-            if len(result) > checks["max_length"]:
-                issues.append(f"very large output: {len(result)} chars")
+            if len(rendered) > checks["max_length"]:
+                issues.append(f"very large output: {len(rendered)} chars")
 
     if issues:
         status = FAIL if any("missing" in i or "not found" in i or "None" in i or "EXCEPTION" in i for i in issues) else WARN
@@ -94,27 +115,23 @@ def run_test(name, func, checks=None, max_time_s=5.0):
         print(f"  {status} {name} [{elapsed:.3f}s] {'; '.join(issues)}")
     else:
         passed += 1
-        print(f"  {PASS} {name} [{elapsed:.3f}s] ({len(result)} chars)")
+        print(f"  {PASS} {name} [{elapsed:.3f}s] ({len(rendered)} chars)")
 
     if "--verbose" in sys.argv and result:
-        preview = result[:300]
-        if len(result) > 300:
-            preview += f"\n    ... ({len(result) - 300} more chars)"
+        preview = rendered[:300]
+        if len(rendered) > 300:
+            preview += f"\n    ... ({len(rendered) - 300} more chars)"
         for line in preview.split("\n"):
             print(f"    | {line}")
 
 
 def validate_multi_term_search_results(query: str, deep: bool = False) -> str:
     result = search_specs(query, deep=deep)
-    if "Search results" not in result:
-        raise AssertionError(f"search_specs did not return results for '{query}': {result}")
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise AssertionError(f"search_specs did not return structured success for '{query}': {result_text(result)}")
 
     terms = [term.lower() for term in query.split() if term]
-    returned_specs = [
-        line[:-1]
-        for line in result.splitlines()
-        if line and not line.startswith(" ") and line.endswith(":") and not line.startswith("Search results")
-    ]
+    returned_specs = [entry["spec_name"] for entry in result.get("results", [])]
     if not returned_specs:
         raise AssertionError(f"search_specs returned no spec sections for '{query}'")
 
@@ -185,50 +202,55 @@ print("\n--- list_specs ---")
 run_test(
     "list all specs",
     lambda: list_specs(),
-    {"contains": ["Found", "specs"], "min_length": 100},
+    {"contains": ['"profile": "core_only"', '"total"', "TS29518_Namf_Communication"], "min_length": 100, "is_valid_json": True},
 )
 run_test(
     "filter by 'amf'",
     lambda: list_specs("amf"),
-    {"contains": ["Namf"]},
+    {"contains": ["Namf", '"results"'], "is_valid_json": True},
 )
 run_test(
     "filter by 'Nausf'",
     lambda: list_specs("Nausf"),
-    {"contains": ["Nausf"]},
+    {"contains": ["Nausf"], "is_valid_json": True},
 )
 run_test(
     "filter with no results",
     lambda: list_specs("zzzznonexistent"),
-    {"contains": ["Found 0"]},
+    {"contains": ['"total": 0'], "is_valid_json": True},
 )
 run_test(
     "filter by title keyword 'authentication'",
     lambda: list_specs("authentication"),
-    {"contains": ["Nausf"]},
+    {"contains": ["Nausf"], "is_valid_json": True},
 )
 run_test(
     "list_specs stays metadata-only",
     lambda: assert_cached_specs(set(), lambda: list_specs("authentication")),
-    {"contains": ["Nausf"]},
+    {"contains": ["Nausf"], "is_valid_json": True},
+)
+run_test(
+    "list all specs with all profile includes CAPIF",
+    lambda: list_specs(profile="all"),
+    {"contains": ["CAPIF", '"profile": "all"'], "is_valid_json": True},
 )
 
 print("\n--- list_specs_by_nf ---")
 run_test(
     "group all NFs",
     lambda: list_specs_by_nf(),
-    {"contains": ["AMF", "SMF", "UDM"], "min_length": 200},
+    {"contains": ['"nf": "AMF"', '"nf": "SMF"', '"nf": "UDM"'], "min_length": 200, "is_valid_json": True},
     max_time_s=10.0,
 )
 run_test(
     "filter AMF",
     lambda: list_specs_by_nf("AMF"),
-    {"contains": ["AMF", "Namf"]},
+    {"contains": ['"requested_nf": "AMF"', "Namf"], "is_valid_json": True},
 )
 run_test(
     "unknown NF",
     lambda: list_specs_by_nf("FAKENZ"),
-    {"contains": ["not recognized"], "expect_found": False},
+    {"contains": ["unknown_nf", "not recognized"], "expect_ok": False, "is_valid_json": True},
 )
 
 print("\n--- get_spec_info ---")
@@ -240,9 +262,10 @@ run_test(
             "title",
             "version",
             "security",
-            "securitySchemes",
+            "security_schemes",
             "oAuth2ClientCredentials",
             "nausf-auth:ue-authentications",
+            "Rel-18",
         ],
         "is_valid_json": True,
     },
@@ -263,7 +286,12 @@ run_test(
 run_test(
     "nonexistent spec",
     lambda: get_spec_info("TS00000_Fake"),
-    {"contains": ["not found"], "expect_found": False},
+    {"contains": ["spec_not_found", "not found"], "expect_ok": False, "is_valid_json": True},
+)
+run_test(
+    "single release compare available",
+    lambda: compare_spec_releases("TS29509_Nausf_UEAuthentication"),
+    {"contains": ["available_releases", "Only one release variant"], "is_valid_json": True},
 )
 
 print("\n--- get_paths ---")
@@ -387,43 +415,43 @@ print("\n--- search_specs ---")
 run_test(
     "search 'PDU Session'",
     lambda: search_specs("PDU Session"),
-    {"contains": ["Search results"], "min_length": 50},
+    {"contains": ['"results"', "TS29502_Nsmf_PDUSession"], "min_length": 50, "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
     "search 'SUPI'",
     lambda: search_specs("SUPI"),
-    {"contains": ["Search results"], "min_length": 50},
+    {"contains": ['"results"'], "min_length": 50, "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
     "search 'authentication'",
     lambda: search_specs("authentication"),
-    {"contains": ["Search results", "Nausf"]},
+    {"contains": ['"results"', "Nausf"], "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
     "search results are ranked",
     lambda: search_specs("authentication"),
-    {"contains": ["ranked by relevance"]},
+    {"contains": ['"score"'], "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
     "deep search 'dnn'",
     lambda: search_specs("dnn", deep=True),
-    {"contains": ["Search results"], "min_length": 50},
+    {"contains": ['"deep": true', '"results"'], "min_length": 50, "is_valid_json": True},
     max_time_s=60.0,
 )
 run_test(
     "deep search 'SUPI'",
     lambda: search_specs("SUPI", deep=True),
-    {"contains": ["Search results"]},
+    {"contains": ['"deep": true'], "is_valid_json": True},
     max_time_s=60.0,
 )
 run_test(
     "multi-word search 'context transfer'",
     lambda: search_specs("context transfer"),
-    {"contains": ["Search results"], "min_length": 50},
+    {"contains": ['"results"'], "min_length": 50, "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
@@ -435,7 +463,7 @@ run_test(
 run_test(
     "multi-word search 'sm-contexts retrieve'",
     lambda: search_specs("sm-contexts retrieve"),
-    {"contains": ["Search results"], "min_length": 50},
+    {"contains": ['"results"', "sm-contexts"], "min_length": 50, "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
@@ -447,13 +475,13 @@ run_test(
 run_test(
     "search with no results",
     lambda: search_specs("zzzznonexistent"),
-    {"contains": ["No results"], "expect_found": False},
+    {"contains": ['"total": 0'], "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
     "search_specs stays metadata-only",
     lambda: assert_cached_specs(set(), lambda: search_specs("authentication")),
-    {"contains": ["Search results", "Nausf"]},
+    {"contains": ["Nausf"], "is_valid_json": True},
     max_time_s=30.0,
 )
 
@@ -473,43 +501,43 @@ run_test(
 run_test(
     "search property 'supi'",
     lambda: search_schema_properties("supi"),
-    {"contains": ["supi"], "min_length": 50},
+    {"contains": ["supi", '"results"'], "min_length": 50, "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
     "search property 'dnn'",
     lambda: search_schema_properties("dnn"),
-    {"contains": ["dnn"], "min_length": 50},
+    {"contains": ["dnn", '"results"'], "min_length": 50, "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
     "search property 'pduSessionId'",
     lambda: search_schema_properties("pduSessionId"),
-    {"min_length": 20},
+    {"min_length": 20, "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
     "search inherited allOf property 'status'",
-    lambda: search_schema_properties("status", max_results=200),
-    {"contains": ["TS29532_Nmbsmf_MBSSession > ExtProblemDetails.status"]},
+    lambda: search_schema_properties("status", max_results=200, profile="all"),
+    {"contains": ["TS29532_Nmbsmf_MBSSession", "ExtProblemDetails", "status"], "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
     "search composed extension property 'accMbsServiceInfo'",
-    lambda: search_schema_properties("accMbsServiceInfo", max_results=200),
-    {"contains": ["TS29532_Nmbsmf_MBSSession > ExtProblemDetails.accMbsServiceInfo"]},
+    lambda: search_schema_properties("accMbsServiceInfo", max_results=200, profile="all"),
+    {"contains": ["TS29532_Nmbsmf_MBSSession", "ExtProblemDetails", "accMbsServiceInfo"], "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
     "search property no match",
     lambda: search_schema_properties("zzzzfakeprop"),
-    {"contains": ["No schemas found"], "expect_found": False},
+    {"contains": ['"total": 0'], "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
     "search_schema_properties stays metadata-only",
     lambda: assert_cached_specs(set(), lambda: search_schema_properties("status", max_results=50)),
-    {"contains": ["status"]},
+    {"contains": ["status"], "is_valid_json": True},
     max_time_s=30.0,
 )
 
@@ -560,33 +588,121 @@ print("\n--- get_request_response_summary ---")
 run_test(
     "AUSF auth summary",
     lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post"),
-    {"contains": ["request_body", "responses"], "min_length": 100},
+    {
+        "contains": [
+            "request_body",
+            "responses",
+            "operation_id",
+            "required_body_fields",
+            "security_requirements",
+            '"detail": "compact"',
+        ],
+        "min_length": 100,
+        "max_length": 12000,
+        "is_valid_json": True,
+    },
     max_time_s=5.0,
 )
 run_test(
-    "summary has operation info",
+    "summary has compact contract fields",
     lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post"),
-    {"contains": ["operation"]},
+    {"contains": ["operation_id", "summary", "success_codes", "error_models", "callback_names"], "is_valid_json": True},
 )
 run_test(
-    "summary truncation works",
+    "summary includes structured output marker",
     lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", max_chars=500),
-    {"contains": ["TRUNCATED"], "min_length": 50},
+    {
+        "contains": ["structured_output", "requested_max_chars", "full_detail_available", '"detail": "compact"'],
+        "min_length": 50,
+        "max_length": 12000,
+        "is_valid_json": True,
+    },
 )
 run_test(
-    "summary unlimited is valid json",
-    lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", max_chars=0),
-    {"contains": ["request_body"], "is_valid_json": True},
+    "summary full detail remains available",
+    lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/ue-authentications", "post", max_chars=0, detail="full"),
+    {"contains": ["request_body", '"detail": "full"', '"schema"'], "is_valid_json": True},
 )
 run_test(
     "summary nonexistent path",
     lambda: get_request_response_summary("TS29509_Nausf_UEAuthentication", "/nonexistent", "post"),
-    {"contains": ["not found"], "expect_found": False},
+    {"contains": ["path_not_found", "not found"], "expect_ok": False, "is_valid_json": True},
 )
 run_test(
     "summary nonexistent spec",
     lambda: get_request_response_summary("TS00000_Fake", "/foo", "post"),
-    {"contains": ["not found"], "expect_found": False},
+    {"contains": ["spec_not_found", "not found"], "expect_ok": False, "is_valid_json": True},
+)
+
+print("\n--- new core tools ---")
+run_test(
+    "list callbacks for Nsmf PDUSession",
+    lambda: list_callbacks("TS29502_Nsmf_PDUSession"),
+    {
+        "contains": ["smContextStatusNotification", "statusNotification", '"total"', '"detail": "compact"'],
+        "max_length": 20000,
+        "is_valid_json": True,
+    },
+)
+run_test(
+    "list callbacks full detail",
+    lambda: list_callbacks("TS29502_Nsmf_PDUSession", detail="full"),
+    {"contains": ["smContextStatusNotification", "response_content", '"detail": "full"'], "is_valid_json": True},
+)
+run_test(
+    "trace UE registration",
+    lambda: trace_procedure("ue registration"),
+    {"contains": ["UE Registration", "TS29509_Nausf_UEAuthentication", "TS29503_Nudm_UECM"], "is_valid_json": True},
+)
+run_test(
+    "trace PDU session establishment",
+    lambda: trace_procedure("pdu session establishment"),
+    {"contains": ["PDU Session Establishment", "TS29502_Nsmf_PDUSession", "TS29512_Npcf_SMPolicyControl"], "is_valid_json": True},
+)
+run_test(
+    "show AMF SMF interactions",
+    lambda: show_nf_interactions("AMF", "SMF"),
+    {"contains": ["TS29502_Nsmf_PDUSession", "/sm-contexts", "smContextStatusNotification"], "is_valid_json": True},
+)
+run_test(
+    "validate payload success",
+    lambda: validate_payload(
+        "TS29509_Nausf_UEAuthentication",
+        "/ue-authentications",
+        "post",
+        {"supiOrSuci": "supi-001010123456789", "servingNetworkName": "5G:mnc001.mcc001.3gppnetwork.org"},
+    ),
+    {"contains": ['"valid": true'], "is_valid_json": True},
+)
+run_test(
+    "validate payload failure",
+    lambda: validate_payload(
+        "TS29509_Nausf_UEAuthentication",
+        "/ue-authentications",
+        "post",
+        {"servingNetworkName": 123},
+    ),
+    {"contains": ['"valid": false', '"error_count"'], "is_valid_json": True},
+)
+run_test(
+    "explain problem details",
+    lambda: explain_problem_details(
+        {
+            "status": 400,
+            "cause": "MANDATORY_IE_MISSING",
+            "detail": "supiOrSuci is required",
+            "invalidParams": [{"param": "/supiOrSuci", "reason": "missing"}],
+        }
+    ),
+    {"contains": ["MANDATORY_IE_MISSING", "invalid_params", "recommendations"], "is_valid_json": True},
+)
+run_test(
+    "match SBI trace",
+    lambda: match_sbi_trace(
+        "2026-04-12T11:00:00Z POST https://core.example.com/nsmf-pdusession/v1/sm-contexts 201\n"
+        "2026-04-12T11:00:01Z POST https://core.example.com/nchf-convergedcharging/v3/chargingdata 201"
+    ),
+    {"contains": ["TS29502_Nsmf_PDUSession", "TS32291_Nchf_ConvergedCharging"], "is_valid_json": True},
 )
 
 print("\n--- get_service_operations ---")
@@ -642,18 +758,18 @@ print("\n--- real-world: SMF PDU Session context transfer audit ---")
 run_test(
     "rw: list SMF specs",
     lambda: list_specs_by_nf("SMF"),
-    {"contains": ["SMF", "TS29502_Nsmf_PDUSession"]},
+    {"contains": ['"requested_nf": "SMF"', "TS29502_Nsmf_PDUSession"], "is_valid_json": True},
 )
 run_test(
     "rw: search 'sm-contexts transfer' finds results",
     lambda: search_specs("sm-contexts transfer"),
-    {"contains": ["Search results", "sm-contexts"], "min_length": 50},
+    {"contains": ['"results"', "sm-contexts"], "min_length": 50, "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
     "rw: search 'context transfer PDU session' finds results",
     lambda: search_specs("context transfer PDU session"),
-    {"contains": ["Search results"], "min_length": 50},
+    {"contains": ['"results"', "TS29502_Nsmf_PDUSession"], "min_length": 50, "is_valid_json": True},
     max_time_s=30.0,
 )
 run_test(
@@ -681,7 +797,12 @@ run_test(
 run_test(
     "rw: retrieve summary stays under default max_chars",
     lambda: get_request_response_summary("TS29502_Nsmf_PDUSession", "/sm-contexts/{smContextRef}/retrieve", "post"),
-    {"contains": ["operation", "responses"], "min_length": 100},
+    {
+        "contains": ["operation_id", "responses", "required_body_fields", '"detail": "compact"'],
+        "min_length": 100,
+        "max_length": 20000,
+        "is_valid_json": True,
+    },
     max_time_s=5.0,
 )
 run_test(
