@@ -166,6 +166,17 @@ def validate_multi_term_search_results(query: str, deep: bool = False) -> str:
     return f"validated {len(returned_specs)} specs for '{query}'"
 
 
+def assert_cached_specs(expected_specs: set[str], func) -> str:
+    specs_cache.clear()
+    result = func()
+    loaded_specs = set(specs_cache.keys())
+    if loaded_specs != expected_specs:
+        raise AssertionError(
+            f"expected cached specs {sorted(expected_specs)}, got {sorted(loaded_specs)}"
+        )
+    return result
+
+
 print("=" * 70)
 print("3GPP MCP Server Test Suite")
 print("=" * 70)
@@ -194,6 +205,11 @@ run_test(
 run_test(
     "filter by title keyword 'authentication'",
     lambda: list_specs("authentication"),
+    {"contains": ["Nausf"]},
+)
+run_test(
+    "list_specs stays metadata-only",
+    lambda: assert_cached_specs(set(), lambda: list_specs("authentication")),
     {"contains": ["Nausf"]},
 )
 
@@ -234,6 +250,14 @@ run_test(
 run_test(
     "CommonData spec info",
     lambda: get_spec_info("TS29571_CommonData"),
+    {"contains": ["title"], "is_valid_json": True},
+)
+run_test(
+    "spec info loads requested spec only",
+    lambda: assert_cached_specs(
+        {"TS29509_Nausf_UEAuthentication"},
+        lambda: get_spec_info("TS29509_Nausf_UEAuthentication"),
+    ),
     {"contains": ["title"], "is_valid_json": True},
 )
 run_test(
@@ -426,6 +450,12 @@ run_test(
     {"contains": ["No results"], "expect_found": False},
     max_time_s=30.0,
 )
+run_test(
+    "search_specs stays metadata-only",
+    lambda: assert_cached_specs(set(), lambda: search_specs("authentication")),
+    {"contains": ["Search results", "Nausf"]},
+    max_time_s=30.0,
+)
 
 print("\n--- search_schema_properties ---")
 run_test(
@@ -476,6 +506,12 @@ run_test(
     {"contains": ["No schemas found"], "expect_found": False},
     max_time_s=30.0,
 )
+run_test(
+    "search_schema_properties stays metadata-only",
+    lambda: assert_cached_specs(set(), lambda: search_schema_properties("status", max_results=50)),
+    {"contains": ["status"]},
+    max_time_s=30.0,
+)
 
 print("\n--- find_references ---")
 run_test(
@@ -495,6 +531,12 @@ run_test(
     lambda: find_references("TS00000_Fake", "FakeSchema"),
     {"contains": ["No references"], "expect_found": False},
     max_time_s=30.0,
+)
+run_test(
+    "find_references stays metadata-only",
+    lambda: assert_cached_specs(set(), lambda: find_references("TS29571_CommonData", "ProblemDetails")),
+    {"contains": ["References"]},
+    max_time_s=60.0,
 )
 
 print("\n--- resolve_ref ---")

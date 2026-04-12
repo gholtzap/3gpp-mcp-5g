@@ -10,10 +10,13 @@ from mcp.server.fastmcp import FastMCP
 SPECS_DIR = Path(__file__).parent
 CACHE_PATH = SPECS_DIR / ".spec_cache.sqlite3"
 specs_cache: dict[str, dict] = {}
+_spec_index: dict[str, dict] | None = None
 _specs_hash: str | None = None
 _disk_cache_initialized = False
 
 DEFAULT_MAX_CHARS = 12000
+HTTP_METHODS = ("get", "post", "put", "patch", "delete", "options", "head")
+SPEC_INDEX_VERSION = 1
 
 NF_GROUPS = {
     "AMF": ["Namf"],
@@ -138,9 +141,61 @@ def _ensure_disk_cache():
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS spec_index_cache (
+                    specs_hash TEXT PRIMARY KEY,
+                    index_json TEXT NOT NULL
+                )
+                """
+            )
             conn.execute("DELETE FROM spec_cache WHERE specs_hash != ?", (_get_specs_hash(),))
+            conn.execute("DELETE FROM spec_index_cache WHERE specs_hash != ?", (_get_specs_hash(),))
         _disk_cache_initialized = True
     except sqlite3.Error:
+        pass
+
+
+def _load_disk_index() -> dict[str, dict] | None:
+    _ensure_disk_cache()
+    try:
+        with sqlite3.connect(CACHE_PATH) as conn:
+            row = conn.execute(
+                "SELECT index_json FROM spec_index_cache WHERE specs_hash = ?",
+                (_get_specs_hash(),),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    if (
+        isinstance(payload, dict)
+        and payload.get("version") == SPEC_INDEX_VERSION
+        and isinstance(payload.get("specs"), dict)
+    ):
+        return payload["specs"]
+    return None
+
+
+def _save_disk_index(index: dict[str, dict]):
+    _ensure_disk_cache()
+    try:
+        with sqlite3.connect(CACHE_PATH) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO spec_index_cache (specs_hash, index_json) VALUES (?, ?)",
+                (
+                    _get_specs_hash(),
+                    json.dumps(
+                        _json_safe({"version": SPEC_INDEX_VERSION, "specs": index}),
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+    except (sqlite3.Error, TypeError, ValueError):
         pass
 
 
@@ -201,8 +256,7 @@ def get_all_spec_files() -> list[str]:
 
 
 def preload_all_specs():
-    for name in get_all_spec_files():
-        load_spec(name)
+    _get_spec_index()
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -211,15 +265,17 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:max_chars] + f"\n\n... OUTPUT TRUNCATED at {max_chars} chars (total {len(text)}). Use more specific queries or get_schema_resolved for individual nested types."
 
 
-def _resolve_ref_obj(ref: str, context_spec_name: str) -> tuple[dict | None, str]:
+def _resolve_ref_obj(ref: str, context_spec_name: str, spec_loader=None) -> tuple[dict | None, str]:
+    if spec_loader is None:
+        spec_loader = load_spec
     if ref.startswith("#"):
-        spec = load_spec(context_spec_name)
+        spec = spec_loader(context_spec_name)
         json_path = ref
         resolved_context = context_spec_name
     elif "#" in ref:
         file_part, json_path = ref.split("#", 1)
         spec_name = file_part.replace(".yaml", "")
-        spec = load_spec(spec_name)
+        spec = spec_loader(spec_name)
         resolved_context = spec_name
     else:
         return None, context_spec_name
@@ -338,6 +394,7 @@ def _collect_properties_deep(
     schema_obj: dict,
     context_spec_name: str | None = None,
     _seen_refs: set[str] | None = None,
+    spec_loader=None,
 ) -> dict:
     if not isinstance(schema_obj, dict):
         return {}
@@ -349,9 +406,16 @@ def _collect_properties_deep(
 
     ref_str = schema_obj.get("$ref")
     if isinstance(ref_str, str) and context_spec_name and ref_str not in _seen_refs:
-        resolved, resolved_context = _resolve_ref_obj(ref_str, context_spec_name)
+        resolved, resolved_context = _resolve_ref_obj(ref_str, context_spec_name, spec_loader=spec_loader)
         if isinstance(resolved, dict):
-            props.update(_collect_properties_deep(resolved, resolved_context, _seen_refs | {ref_str}))
+            props.update(
+                _collect_properties_deep(
+                    resolved,
+                    resolved_context,
+                    _seen_refs | {ref_str},
+                    spec_loader=spec_loader,
+                )
+            )
 
     inline_props = schema_obj.get("properties", {})
     if isinstance(inline_props, dict):
@@ -360,15 +424,155 @@ def _collect_properties_deep(
     for composition_key in ("allOf", "oneOf", "anyOf"):
         for sub in schema_obj.get(composition_key, []):
             if isinstance(sub, dict):
-                props.update(_collect_properties_deep(sub, context_spec_name, _seen_refs))
+                props.update(
+                    _collect_properties_deep(
+                        sub,
+                        context_spec_name,
+                        _seen_refs,
+                        spec_loader=spec_loader,
+                    )
+                )
 
     return props
+
+
+def _extract_property_type(prop_def) -> str:
+    if not isinstance(prop_def, dict):
+        return ""
+    ref_str = prop_def.get("$ref")
+    if isinstance(ref_str, str):
+        return ref_str.split("/")[-1]
+    prop_type = prop_def.get("type", "")
+    return prop_type if isinstance(prop_type, str) else ""
+
+
+def _collect_refs(obj, path_prefix: str, refs: list[dict[str, str]]):
+    if isinstance(obj, dict):
+        ref_str = obj.get("$ref")
+        if isinstance(ref_str, str):
+            refs.append({"path": path_prefix, "ref": ref_str})
+            return
+        for key, value in obj.items():
+            _collect_refs(value, f"{path_prefix}/{key}", refs)
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            _collect_refs(item, f"{path_prefix}[{idx}]", refs)
+
+
+def _build_spec_index() -> dict[str, dict]:
+    raw_specs: dict[str, dict] = {}
+    spec_names = get_all_spec_files()
+
+    for spec_name in spec_names:
+        path = SPECS_DIR / f"{spec_name}.yaml"
+        with open(path) as f:
+            spec = yaml.load(f, Loader=_yaml_loader)
+        if isinstance(spec, dict):
+            raw_specs[spec_name] = spec
+
+    def raw_loader(spec_name: str) -> dict | None:
+        return raw_specs.get(_canonical_spec_name(spec_name))
+
+    index: dict[str, dict] = {}
+    for spec_name in spec_names:
+        spec = raw_specs.get(spec_name, {})
+        info = spec.get("info", {}) if isinstance(spec, dict) else {}
+        components = spec.get("components", {}) if isinstance(spec, dict) else {}
+        schemas = components.get("schemas", {}) if isinstance(components, dict) else {}
+
+        path_entries: list[str] = []
+        operations: list[dict] = []
+        paths = spec.get("paths", {}) if isinstance(spec, dict) else {}
+        if isinstance(paths, dict):
+            for path_str, path_obj in paths.items():
+                path_text = str(path_str)
+                path_entries.append(path_text)
+                if not isinstance(path_obj, dict):
+                    continue
+                for method, details in path_obj.items():
+                    if method not in HTTP_METHODS or not isinstance(details, dict):
+                        continue
+                    parameter_names = []
+                    for param in details.get("parameters", []):
+                        if isinstance(param, dict) and param.get("name"):
+                            parameter_names.append(str(param["name"]))
+                    operations.append(
+                        {
+                            "path": path_text,
+                            "method": method,
+                            "summary": str(details.get("summary", "")),
+                            "description": str(details.get("description", "")),
+                            "operation_id": str(details.get("operationId", "")),
+                            "parameters": parameter_names,
+                        }
+                    )
+
+        schema_entries: dict[str, dict] = {}
+        if isinstance(schemas, dict):
+            for schema_name, schema_obj in schemas.items():
+                if not isinstance(schema_obj, dict):
+                    continue
+                required = {
+                    item
+                    for item in schema_obj.get("required", [])
+                    if isinstance(item, str)
+                }
+                flattened_props = _collect_properties_deep(
+                    schema_obj,
+                    spec_name,
+                    spec_loader=raw_loader,
+                )
+                schema_entries[str(schema_name)] = {
+                    "description": str(schema_obj.get("description", "")),
+                    "enum_values": [str(value) for value in schema_obj.get("enum", [])],
+                    "properties": {
+                        str(prop_name): {
+                            "type": _extract_property_type(prop_def),
+                            "required": prop_name in required,
+                        }
+                        for prop_name, prop_def in flattened_props.items()
+                    },
+                }
+
+        refs: list[dict[str, str]] = []
+        if isinstance(paths, dict):
+            _collect_refs(paths, f"{spec_name}/paths", refs)
+        if isinstance(components, dict):
+            _collect_refs(components, f"{spec_name}/components", refs)
+
+        index[spec_name] = {
+            "title": str(info.get("title", "")) if isinstance(info, dict) else "",
+            "version": str(info.get("version", "")) if isinstance(info, dict) else "",
+            "description": str(info.get("description", "")) if isinstance(info, dict) else "",
+            "paths": path_entries,
+            "operations": operations,
+            "schemas": schema_entries,
+            "references": refs,
+        }
+
+    return index
+
+
+def _get_spec_index() -> dict[str, dict]:
+    global _spec_index
+    if _spec_index is not None:
+        return _spec_index
+
+    cached_index = _load_disk_index()
+    if cached_index is not None:
+        _spec_index = cached_index
+        return cached_index
+
+    _spec_index = _build_spec_index()
+    _save_disk_index(_spec_index)
+    return _spec_index
 
 
 @mcp.tool()
 def list_specs(filter: str = "") -> str:
     """List available 3GPP specs. Optionally filter by keyword (e.g. 'amf', 'Nausf', 'TS29509', 'authentication').
     Searches both spec filenames AND titles. Returns spec name, title, and version."""
+    spec_index = _get_spec_index()
     specs = get_all_spec_files()
     if filter:
         pattern = filter.lower()
@@ -377,19 +581,17 @@ def list_specs(filter: str = "") -> str:
             if pattern in s.lower():
                 filtered.append(s)
             else:
-                spec = load_spec(s)
-                if spec and "info" in spec:
-                    title = spec["info"].get("title", "")
-                    if pattern in title.lower():
-                        filtered.append(s)
+                title = spec_index.get(s, {}).get("title", "")
+                if pattern in title.lower():
+                    filtered.append(s)
         specs = filtered
 
     results = []
     for name in specs:
-        spec = load_spec(name)
-        if spec and "info" in spec:
-            title = spec["info"].get("title", "")
-            version = spec["info"].get("version", "")
+        spec_meta = spec_index.get(name, {})
+        title = spec_meta.get("title", "")
+        version = spec_meta.get("version", "")
+        if title or version:
             results.append(f"{name}: {title} (v{version})")
         else:
             results.append(name)
@@ -619,19 +821,16 @@ def search_specs(query: str, max_results: int = 20, deep: bool = False) -> str:
         return "Empty query."
     query_lower = query.lower()
     scored_results = []
+    spec_index = _get_spec_index()
 
     for name in get_all_spec_files():
-        spec = load_spec(name)
-        if not spec:
-            continue
-
+        spec_meta = spec_index.get(name, {})
         matches = []
         score = 0
         term_hits = set()
 
-        info = spec.get("info", {})
-        title = info.get("title", "")
-        desc = info.get("description", "")
+        title = spec_meta.get("title", "")
+        desc = spec_meta.get("description", "")
         title_hits = _any_term_in(terms, title)
         desc_hits = _any_term_in(terms, desc)
         if query_lower in title.lower():
@@ -651,51 +850,49 @@ def search_specs(query: str, max_results: int = 20, deep: bool = False) -> str:
             score += 40 * len(desc_hits) // len(terms)
             term_hits.update(desc_hits)
 
-        for path_str, path_obj in spec.get("paths", {}).items():
+        for path_str in spec_meta.get("paths", []):
             path_hits = _any_term_in(terms, path_str)
             if path_hits:
                 matches.append(f"path: {path_str}")
                 score += 50 * len(path_hits) // len(terms)
                 term_hits.update(path_hits)
-            if deep and isinstance(path_obj, dict):
-                for method, details in path_obj.items():
-                    if not isinstance(details, dict):
-                        continue
-                    op_summary = details.get("summary", "")
-                    op_desc = details.get("description", "")
-                    op_id = details.get("operationId", "")
-                    for text in (op_summary, op_desc, op_id):
-                        text_hits = _any_term_in(terms, str(text))
-                        if text_hits:
-                            matches.append(f"operation: {method.upper()} {path_str} ({str(text)[:60]})")
-                            score += 20 * len(text_hits) // len(terms)
-                            term_hits.update(text_hits)
-                            break
-                    for param in details.get("parameters", []):
-                        if isinstance(param, dict):
-                            pname = param.get("name", "")
-                            if _any_term_in(terms, pname):
-                                matches.append(f"parameter: {pname} in {method.upper()} {path_str}")
-                                score += 10
-                                term_hits.update(_any_term_in(terms, pname))
+        if deep:
+            for operation in spec_meta.get("operations", []):
+                method = str(operation.get("method", "")).upper()
+                path_str = str(operation.get("path", ""))
+                for text in (
+                    operation.get("summary", ""),
+                    operation.get("description", ""),
+                    operation.get("operation_id", ""),
+                ):
+                    text_hits = _any_term_in(terms, str(text))
+                    if text_hits:
+                        matches.append(f"operation: {method} {path_str} ({str(text)[:60]})")
+                        score += 20 * len(text_hits) // len(terms)
+                        term_hits.update(text_hits)
+                        break
+                for pname in operation.get("parameters", []):
+                    param_hits = _any_term_in(terms, pname)
+                    if param_hits:
+                        matches.append(f"parameter: {pname} in {method} {path_str}")
+                        score += 10
+                        term_hits.update(param_hits)
 
-        schemas = spec.get("components", {}).get("schemas", {})
-        for schema_name, schema_obj in schemas.items():
+        for schema_name, schema_meta in spec_meta.get("schemas", {}).items():
             schema_hits = _any_term_in(terms, schema_name)
             if schema_hits:
                 matches.append(f"schema: {schema_name}")
                 score += 40 * len(schema_hits) // len(terms)
                 term_hits.update(schema_hits)
-            elif deep and isinstance(schema_obj, dict):
-                all_props = _collect_properties_deep(schema_obj, name)
-                for prop_name in all_props:
+            elif deep and isinstance(schema_meta, dict):
+                for prop_name in schema_meta.get("properties", {}):
                     prop_hits = _any_term_in(terms, prop_name)
                     if prop_hits:
                         matches.append(f"property: {schema_name}.{prop_name}")
                         score += 5
                         term_hits.update(prop_hits)
                         break
-                enum_vals = schema_obj.get("enum", [])
+                enum_vals = schema_meta.get("enum_values", [])
                 for val in enum_vals:
                     val_hits = _any_term_in(terms, str(val))
                     if val_hits:
@@ -703,7 +900,7 @@ def search_specs(query: str, max_results: int = 20, deep: bool = False) -> str:
                         score += 5
                         term_hits.update(val_hits)
                         break
-                schema_desc = schema_obj.get("description", "")
+                schema_desc = schema_meta.get("description", "")
                 desc_term_hits = _any_term_in(terms, schema_desc)
                 if desc_term_hits:
                     matches.append(f"schema description: {schema_name}")
@@ -738,28 +935,18 @@ def search_schema_properties(property_name: str, max_results: int = 30) -> str:
     Example: search_schema_properties('supi'), search_schema_properties('dnn')"""
     prop_lower = property_name.lower()
     results = []
+    spec_index = _get_spec_index()
 
     for spec_name in get_all_spec_files():
-        spec = load_spec(spec_name)
-        if not spec:
-            continue
-
-        schemas = spec.get("components", {}).get("schemas", {})
-        for schema_name, schema_obj in schemas.items():
-            if not isinstance(schema_obj, dict):
-                continue
-            props = _collect_properties_deep(schema_obj, spec_name)
-            matching_props = [p for p in props if prop_lower in p.lower()]
+        schemas = spec_index.get(spec_name, {}).get("schemas", {})
+        for schema_name, schema_meta in schemas.items():
+            properties = schema_meta.get("properties", {}) if isinstance(schema_meta, dict) else {}
+            matching_props = [p for p in properties if prop_lower in p.lower()]
             if matching_props:
-                required = schema_obj.get("required", [])
                 for p in matching_props:
-                    req_marker = " (required)" if p in required else ""
-                    prop_type = ""
-                    prop_def = props[p]
-                    if isinstance(prop_def, dict):
-                        prop_type = prop_def.get("type", "")
-                        if "$ref" in prop_def:
-                            prop_type = prop_def["$ref"].split("/")[-1]
+                    prop_meta = properties.get(p, {})
+                    req_marker = " (required)" if prop_meta.get("required") else ""
+                    prop_type = prop_meta.get("type", "") if isinstance(prop_meta, dict) else ""
                     results.append(f"{spec_name} > {schema_name}.{p}: {prop_type}{req_marker}")
 
         if len(results) >= max_results:
@@ -786,28 +973,18 @@ def find_references(spec_name: str, schema_name: str = "", max_results: int = 30
 
     ref_lower = ref_pattern.lower()
     results = []
-
-    def _scan_refs(obj, path_prefix: str):
-        if isinstance(obj, dict):
-            if "$ref" in obj and ref_lower in obj["$ref"].lower():
-                results.append(f"  {path_prefix}: {obj['$ref']}")
-                return
-            for k, v in obj.items():
-                _scan_refs(v, f"{path_prefix}/{k}")
-        elif isinstance(obj, list):
-            for i, item in enumerate(obj):
-                _scan_refs(item, f"{path_prefix}[{i}]")
+    spec_index = _get_spec_index()
 
     for name in get_all_spec_files():
         if name == spec_name:
             continue
-        spec = load_spec(name)
-        if not spec:
-            continue
-
         before_count = len(results)
-        _scan_refs(spec.get("paths", {}), f"{name}/paths")
-        _scan_refs(spec.get("components", {}), f"{name}/components")
+        for ref_entry in spec_index.get(name, {}).get("references", []):
+            ref_str = ref_entry.get("ref", "")
+            if ref_lower in ref_str.lower():
+                results.append(f"  {ref_entry.get('path', '')}: {ref_str}")
+                if len(results) >= max_results:
+                    break
         if len(results) > before_count:
             results.insert(before_count, f"\n{name}:")
 
