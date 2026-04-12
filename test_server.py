@@ -5,6 +5,7 @@ import json
 
 sys.path.insert(0, ".")
 from server import (
+    _collect_properties_deep,
     list_specs,
     list_specs_by_nf,
     get_spec_info,
@@ -418,6 +419,18 @@ run_test(
 
 print("\n--- search_schema_properties ---")
 run_test(
+    "collect composed ref properties for ExtProblemDetails",
+    lambda: json.dumps(
+        sorted(
+            _collect_properties_deep(
+                load_spec("TS29532_Nmbsmf_MBSSession")["components"]["schemas"]["ExtProblemDetails"],
+                "TS29532_Nmbsmf_MBSSession",
+            ).keys()
+        )
+    ),
+    {"contains": ["status", "accMbsServiceInfo"]},
+)
+run_test(
     "search property 'supi'",
     lambda: search_schema_properties("supi"),
     {"contains": ["supi"], "min_length": 50},
@@ -433,6 +446,18 @@ run_test(
     "search property 'pduSessionId'",
     lambda: search_schema_properties("pduSessionId"),
     {"min_length": 20},
+    max_time_s=30.0,
+)
+run_test(
+    "search inherited allOf property 'status'",
+    lambda: search_schema_properties("status", max_results=200),
+    {"contains": ["TS29532_Nmbsmf_MBSSession > ExtProblemDetails.status"]},
+    max_time_s=30.0,
+)
+run_test(
+    "search composed extension property 'accMbsServiceInfo'",
+    lambda: search_schema_properties("accMbsServiceInfo", max_results=200),
+    {"contains": ["TS29532_Nmbsmf_MBSSession > ExtProblemDetails.accMbsServiceInfo"]},
     max_time_s=30.0,
 )
 run_test(

@@ -258,15 +258,34 @@ def _deep_resolve(obj, context_spec_name: str, depth: int = 0, max_depth: int = 
     return obj
 
 
-def _collect_properties_deep(schema_obj: dict) -> dict:
-    props = dict(schema_obj.get("properties", {}))
+def _collect_properties_deep(
+    schema_obj: dict,
+    context_spec_name: str | None = None,
+    _seen_refs: set[str] | None = None,
+) -> dict:
+    if not isinstance(schema_obj, dict):
+        return {}
+
+    if _seen_refs is None:
+        _seen_refs = set()
+
+    props = {}
+
+    ref_str = schema_obj.get("$ref")
+    if isinstance(ref_str, str) and context_spec_name and ref_str not in _seen_refs:
+        resolved, resolved_context = _resolve_ref_obj(ref_str, context_spec_name)
+        if isinstance(resolved, dict):
+            props.update(_collect_properties_deep(resolved, resolved_context, _seen_refs | {ref_str}))
+
+    inline_props = schema_obj.get("properties", {})
+    if isinstance(inline_props, dict):
+        props.update(inline_props)
+
     for composition_key in ("allOf", "oneOf", "anyOf"):
         for sub in schema_obj.get(composition_key, []):
             if isinstance(sub, dict):
-                if "properties" in sub:
-                    props.update(sub["properties"])
-                if "$ref" not in sub:
-                    props.update(_collect_properties_deep(sub))
+                props.update(_collect_properties_deep(sub, context_spec_name, _seen_refs))
+
     return props
 
 
@@ -589,7 +608,7 @@ def search_specs(query: str, max_results: int = 20, deep: bool = False) -> str:
                 score += 40 * len(schema_hits) // len(terms)
                 term_hits.update(schema_hits)
             elif deep and isinstance(schema_obj, dict):
-                all_props = _collect_properties_deep(schema_obj)
+                all_props = _collect_properties_deep(schema_obj, name)
                 for prop_name in all_props:
                     prop_hits = _any_term_in(terms, prop_name)
                     if prop_hits:
@@ -650,7 +669,7 @@ def search_schema_properties(property_name: str, max_results: int = 30) -> str:
         for schema_name, schema_obj in schemas.items():
             if not isinstance(schema_obj, dict):
                 continue
-            props = _collect_properties_deep(schema_obj)
+            props = _collect_properties_deep(schema_obj, spec_name)
             matching_props = [p for p in props if prop_lower in p.lower()]
             if matching_props:
                 required = schema_obj.get("required", [])
