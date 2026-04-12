@@ -219,7 +219,17 @@ print("\n--- get_spec_info ---")
 run_test(
     "AUSF UE Auth spec info",
     lambda: get_spec_info("TS29509_Nausf_UEAuthentication"),
-    {"contains": ["title", "version"], "is_valid_json": True},
+    {
+        "contains": [
+            "title",
+            "version",
+            "security",
+            "securitySchemes",
+            "oAuth2ClientCredentials",
+            "nausf-auth:ue-authentications",
+        ],
+        "is_valid_json": True,
+    },
 )
 run_test(
     "CommonData spec info",

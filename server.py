@@ -372,11 +372,14 @@ def get_spec_info(spec_name: str) -> str:
         return f"Spec '{spec_name}' not found. Use list_specs() to see available specs."
 
     info = spec.get("info", {})
+    components = spec.get("components", {})
     result = {
         "title": info.get("title"),
         "version": info.get("version"),
         "description": info.get("description"),
         "servers": spec.get("servers"),
+        "security": spec.get("security"),
+        "securitySchemes": components.get("securitySchemes"),
         "externalDocs": spec.get("externalDocs"),
     }
     return json.dumps(result, indent=2)
