@@ -1,14 +1,17 @@
-import yaml
 import json
 import re
-import pickle
 import hashlib
+import sqlite3
 from pathlib import Path
+
+import yaml
 from mcp.server.fastmcp import FastMCP
 
 SPECS_DIR = Path(__file__).parent
-CACHE_PATH = SPECS_DIR / ".spec_cache.pkl"
+CACHE_PATH = SPECS_DIR / ".spec_cache.sqlite3"
 specs_cache: dict[str, dict] = {}
+_specs_hash: str | None = None
+_disk_cache_initialized = False
 
 DEFAULT_MAX_CHARS = 12000
 
@@ -93,40 +96,103 @@ def _compute_specs_hash() -> str:
     return h.hexdigest()
 
 
-def _load_disk_cache() -> bool:
-    global specs_cache
-    if not CACHE_PATH.exists():
-        return False
-    try:
-        with open(CACHE_PATH, "rb") as f:
-            data = pickle.load(f)
-        if data.get("hash") != _compute_specs_hash():
-            return False
-        specs_cache = data["specs"]
-        return True
-    except Exception:
-        return False
+def _get_specs_hash() -> str:
+    global _specs_hash
+    if _specs_hash is None:
+        _specs_hash = _compute_specs_hash()
+    return _specs_hash
 
 
-def _save_disk_cache():
+def _canonical_spec_name(name: str) -> str:
+    return name[:-5] if name.endswith(".yaml") else name
+
+
+def _json_safe(obj):
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(item) for item in obj]
+    if isinstance(obj, tuple):
+        return [_json_safe(item) for item in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    isoformat = getattr(obj, "isoformat", None)
+    if callable(isoformat):
+        return isoformat()
+    return str(obj)
+
+
+def _ensure_disk_cache():
+    global _disk_cache_initialized
+    if _disk_cache_initialized:
+        return
     try:
-        data = {"hash": _compute_specs_hash(), "specs": specs_cache}
-        with open(CACHE_PATH, "wb") as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-    except Exception:
+        with sqlite3.connect(CACHE_PATH) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS spec_cache (
+                    specs_hash TEXT NOT NULL,
+                    spec_name TEXT NOT NULL,
+                    spec_json TEXT NOT NULL,
+                    PRIMARY KEY (specs_hash, spec_name)
+                )
+                """
+            )
+            conn.execute("DELETE FROM spec_cache WHERE specs_hash != ?", (_get_specs_hash(),))
+        _disk_cache_initialized = True
+    except sqlite3.Error:
+        pass
+
+
+def _load_disk_cache(spec_name: str) -> dict | None:
+    _ensure_disk_cache()
+    try:
+        with sqlite3.connect(CACHE_PATH) as conn:
+            row = conn.execute(
+                "SELECT spec_json FROM spec_cache WHERE specs_hash = ? AND spec_name = ?",
+                (_get_specs_hash(), spec_name),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    try:
+        spec = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    return spec if isinstance(spec, dict) else None
+
+
+def _save_disk_cache(spec_name: str, spec: dict):
+    _ensure_disk_cache()
+    try:
+        with sqlite3.connect(CACHE_PATH) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO spec_cache (specs_hash, spec_name, spec_json) VALUES (?, ?, ?)",
+                (_get_specs_hash(), spec_name, json.dumps(_json_safe(spec), separators=(",", ":"))),
+            )
+    except (sqlite3.Error, TypeError, ValueError):
         pass
 
 
 def load_spec(name: str) -> dict | None:
-    if name in specs_cache:
-        return specs_cache[name]
-    filename = name if name.endswith(".yaml") else name + ".yaml"
+    spec_name = _canonical_spec_name(name)
+    if spec_name in specs_cache:
+        return specs_cache[spec_name]
+
+    cached_spec = _load_disk_cache(spec_name)
+    if cached_spec is not None:
+        specs_cache[spec_name] = cached_spec
+        return cached_spec
+
+    filename = spec_name + ".yaml"
     path = SPECS_DIR / filename
     if not path.exists():
         return None
     with open(path) as f:
         spec = yaml.load(f, Loader=_yaml_loader)
-    specs_cache[name] = spec
+    specs_cache[spec_name] = spec
+    _save_disk_cache(spec_name, spec)
     return spec
 
 
@@ -135,11 +201,8 @@ def get_all_spec_files() -> list[str]:
 
 
 def preload_all_specs():
-    if _load_disk_cache():
-        return
     for name in get_all_spec_files():
         load_spec(name)
-    _save_disk_cache()
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -946,9 +1009,6 @@ def diff_schemas(spec_name_a: str, schema_name_a: str, spec_name_b: str, schema_
     result.append(f"\nSummary: {len(props_a)} vs {len(props_b)} properties, {len(only_a)} unique to A, {len(only_b)} unique to B, {len(common)} shared")
 
     return "\n".join(result)
-
-
-preload_all_specs()
 
 if __name__ == "__main__":
     mcp.run()
